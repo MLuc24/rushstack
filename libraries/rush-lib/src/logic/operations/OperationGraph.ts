@@ -390,7 +390,7 @@ export class OperationGraph implements IOperationGraph {
     }
   }
 
-  public async closeRunnersAsync(operations?: Operation[]): Promise<void> {
+  public async closeRunnersAsync(operations?: Iterable<Operation>): Promise<void> {
     const promises: Promise<void>[] = [];
     const recordMap: ReadonlyMap<Operation, OperationExecutionRecord> =
       this._currentIteration?.records ?? this.resultByOperation;
@@ -799,10 +799,6 @@ export class OperationGraph implements IOperationGraph {
       onStartAsync: onOperationStartAsync,
       onResultAsync: onOperationCompleteAsync
     };
-    // Track runners closed by normal operation completion so the end-of-iteration fallback does not
-    // issue a concurrent or duplicate closeAsync() call for the same runner.
-    const recordsWithRunnerCleanup: Set<OperationExecutionRecord> = new Set();
-    const graph: OperationGraph = this;
 
     if (!this.quietMode) {
       const plural: string = totalOperations === 1 ? '' : 's';
@@ -879,7 +875,7 @@ export class OperationGraph implements IOperationGraph {
 
     const recordsToClose: OperationExecutionRecord[] = [];
     for (const record of executionRecords.values()) {
-      if (!recordsWithRunnerCleanup.has(record) && !record.shouldRunnerPersist) {
+      if (!record.shouldRunnerPersist) {
         recordsToClose.push(record);
       }
     }
@@ -889,19 +885,18 @@ export class OperationGraph implements IOperationGraph {
       _reportOperationErrorIfAny(record);
       state.hasAnyFailures = true;
     }
-    await Async.forEachAsync(
-      recordsToClose,
-      async (record: OperationExecutionRecord) => {
-        try {
-          await this.closeRunnersAsync([record.operation]);
-        } catch (e) {
+    if (recordsToClose.length > 0) {
+      try {
+        await this.closeRunnersAsync(recordsToClose.map((record) => record.operation));
+      } catch (e) {
+        for (const record of recordsToClose) {
           reportRunnerCleanupFailure(record, e);
         }
-      },
-      { concurrency: this.parallelism }
-    );
+      }
+    }
     for (const record of executionRecords.values()) {
-      record.finalize();
+      record.stdioSummarizer.close();
+      record.problemCollector.close();
     }
 
     const status: OperationStatus = (() => {
@@ -1057,18 +1052,6 @@ export class OperationGraph implements IOperationGraph {
           _reportOperationErrorIfAny(record);
           record.error = e;
           record.status = OperationStatus.Failure;
-        }
-        if (!record.shouldRunnerPersist) {
-          // The runner's executeAsync() and the post-operation hook have both settled before cleanup,
-          // so persistence cleanup cannot race this operation's execution.
-          recordsWithRunnerCleanup.add(record);
-          try {
-            await graph.closeRunnersAsync([record.operation]);
-          } catch (e) {
-            _reportOperationErrorIfAny(record);
-            record.error = e;
-            record.status = OperationStatus.Failure;
-          }
         }
         _onOperationComplete(record, state);
       }
